@@ -23,6 +23,6 @@ XAIProject/
 
 ## How to run:
 
-pip install -r requirements.txt
+pip install -r requirements.txt  
 streamlit run app.py
 
