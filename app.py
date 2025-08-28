@@ -184,21 +184,103 @@ def load_and_train_models(csv_path: str):
     return df, X, y, models
 
 # --------------------------- SHAP / DiCE helpers --------------------------- #
-def shap_topk_bar(pipe, X_df, instance_df, k=TOPK_SHAP, title="SHAP contributions (top-k)"):
+import re
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+def _transform_and_names(pipe, X_df):
+    """Transform X_df with the pipeline's preprocessor and return (X_trans, trans_feature_names, groups_map)."""
+    pre = pipe.named_steps['prep']
+    X_trans = pre.transform(X_df)
+
+    # Get transformed feature names (sklearn >=1.0)
+    try:
+        trans_names = pre.get_feature_names_out()
+    except Exception:
+        # Fallback: generic names
+        trans_names = np.array([f"f{i}" for i in range(X_trans.shape[1])])
+
+    # Build a grouping map from transformed names back to original raw feature names
+    # Typical patterns:
+    #   "num__age"  -> group "age"
+    #   "cat__cp_asymptomatic" -> group "cp"
+    groups = []
+    for name in trans_names:
+        if name.startswith("num__"):
+            groups.append(name.replace("num__", ""))  # e.g., age, trestbps
+        elif name.startswith("cat__"):
+            # cat__<raw_feature>_<value>
+            s = name.replace("cat__", "")
+            # raw feature is up to the first '_' (remaining is category value)
+            raw = s.split("_", 1)[0]
+            groups.append(raw)
+        else:
+            groups.append(name)
+    groups = np.array(groups)
+    return X_trans, trans_names, groups
+
+def shap_topk_bar(pipe, X_df, instance_df, k=8, title="SHAP contributions (top-k)"):
+    """Compute SHAP on the pipeline's transformed numeric space, then aggregate back to raw feature names."""
+    # Prepare transformed data
+    # Use a small background sample to keep it responsive
     bg = X_df.sample(min(len(X_df), N_SHAP_BACKGROUND), random_state=42)
-    f = lambda data: pipe.predict_proba(pd.DataFrame(data, columns=X_df.columns))[:,1]
-    with st.spinner("Computing SHAP explanations..."):
-        explainer = shap.Explainer(f, bg, feature_names=X_df.columns)
-        sv = explainer(instance_df.values)[0]
-    shap_vals = pd.Series(sv.values, index=X_df.columns).sort_values(key=np.abs, ascending=False)[:k]
+    X_bg_t, trans_names, groups = _transform_and_names(pipe, bg)
+    X_inst_t, _, _ = _transform_and_names(pipe, instance_df)
+
+    clf = pipe.named_steps['clf']
+
+    # Choose explainer based on model type
+    if HAS_XGB and isinstance(clf, XGBClassifier):
+        explainer = shap.TreeExplainer(clf)
+        # class-1 SHAP values for binary classification
+        sv_all = explainer.shap_values(X_inst_t)
+        # xgboost returns array for class-1 directly (newer shap), or list [class0, class1] (older shap).
+        if isinstance(sv_all, list):
+            sv = sv_all[1]  # take class 1
+        else:
+            sv = sv_all
+        sv = sv.reshape(1, -1)
+    elif isinstance(clf, RandomForestClassifier):
+        explainer = shap.TreeExplainer(clf)
+        sv_all = explainer.shap_values(X_inst_t)
+        # RandomForest usually returns list per class
+        if isinstance(sv_all, list):
+            sv = sv_all[1]
+        else:
+            sv = sv_all
+        sv = sv.reshape(1, -1)
+    elif isinstance(clf, LogisticRegression):
+        # LinearExplainer on transformed numeric features
+        explainer = shap.LinearExplainer(clf, X_bg_t)
+        sv = explainer.shap_values(X_inst_t)
+        if isinstance(sv, list):  # sometimes returns [class0, class1]
+            sv = sv[1]
+        sv = np.array(sv).reshape(1, -1)
+    else:
+        # Fallback: KernelExplainer on transformed numeric features
+        f = lambda data: clf.predict_proba(data)[:, 1] if hasattr(clf, "predict_proba") else clf.predict(data)
+        explainer = shap.KernelExplainer(f, X_bg_t)
+        sv = explainer.shap_values(X_inst_t, nsamples=100)
+        if isinstance(sv, list):
+            sv = sv[1]
+        sv = np.array(sv).reshape(1, -1)
+
+    # Aggregate OHE columns back to their raw feature groups by summing contributions
+    sv_series = pd.Series(sv.flatten(), index=trans_names)
+    agg = sv_series.groupby(groups).sum().sort_values(key=np.abs, ascending=False)
+
+    topk = agg.head(k)
+
+    # Plot barh with direction (positive/negative)
     fig, ax = plt.subplots(figsize=(7, 4))
-    colors = ['#1f77b4' if v>=0 else '#d62728' for v in shap_vals.values]
-    ax.barh(range(len(shap_vals))[::-1], shap_vals.values[::-1],
-            tick_label=[pretty(c) for c in shap_vals.index[::-1]], color=colors)
+    colors = ['#1f77b4' if v >= 0 else '#d62728' for v in topk.values]
+    ax.barh(range(len(topk))[::-1], topk.values[::-1], tick_label=[pretty(c) for c in topk.index[::-1]], color=colors)
     ax.axvline(0, linestyle='--', linewidth=1)
-    ax.set_title(title); ax.set_xlabel("SHAP value")
+    ax.set_title(title)
+    ax.set_xlabel("SHAP value (aggregated to raw features)")
     fig.tight_layout()
-    return fig, shap_vals, sv.base_values
+
+    return fig, topk, None  # base value not necessary for this bar plot
 
 def dice_cf(pipeline, raw_df, query_instance, immutables, permitted_range, n_cf=N_CF, desired_class=0, method="genetic"):
     d = dice_ml.Data(
