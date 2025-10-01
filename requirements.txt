@@ -5,5 +5,7 @@ scikit-learn
 shap
 dice-ml
 reportlab
-xgboost
 matplotlib
+xgboost
+openai>=1.0.0
+python-dotenv

@@ -1,13 +1,16 @@
-# app.py — NO UPLOAD, AUTO-LOAD CSV, CACHE MODELS
-# ------------------------------------------------
-# Run: python -m streamlit run app.py
+# app.py — Clean UI + .env OpenAI + Fixed Keys
+# ---------------------------------------------
+# Run: streamlit run app.py
+# Data: place heart_disease_uci.csv next to this file
+# .env: OPENAI_API_KEY=sk-...
 
-import os, io, json, uuid, time
+import os, json, re
 from datetime import datetime
+
 import numpy as np
 import pandas as pd
-import streamlit as st
 import matplotlib.pyplot as plt
+import streamlit as st
 
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
@@ -37,10 +40,155 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 
-st.set_page_config(page_title="Counterfactual Explorer (Heart Disease)", layout="wide")
+# ---------- .env + OpenAI (safe) ----------
+from dotenv import load_dotenv
+load_dotenv()  # loads OPENAI_API_KEY from .env
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = "gpt-4o-mini"
+
+OPENAI_AVAILABLE = False
+_openai_mode = None
+_openai_client = None
+try:
+    from openai import OpenAI  # SDK v1+
+    if OPENAI_API_KEY:
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        _openai_mode = "v1"
+        OPENAI_AVAILABLE = True
+except Exception:
+    try:
+        import openai  # legacy
+        if OPENAI_API_KEY:
+            openai.api_key = OPENAI_API_KEY
+            _openai_mode = "legacy"
+            OPENAI_AVAILABLE = True
+    except Exception:
+        OPENAI_AVAILABLE = False
+        _openai_mode = None
+        _openai_client = None
+
+
+def get_openai_client():
+    """Return a callable chat() or None if unavailable."""
+    if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
+        return None
+
+    if _openai_mode == "v1":
+        def _chat(model, messages, temperature=0.35, max_tokens=180):
+            resp = _openai_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content.strip()
+        return _chat
+
+    if _openai_mode == "legacy":
+        def _chat(model, messages, temperature=0.35, max_tokens=180):
+            resp = openai.ChatCompletion.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+        return _chat
+
+    return None
+
+
+def format_suggestion_prompt(changes, patient_context):
+    """
+    Build a short, safe prompt for suggestions.
+    """
+    bullets = "\n".join([f"- {c['feature']}: {c['before']} → {c['after']}" for c in changes])
+    ctx_keys = ['age', 'sex', 'fbs', 'exang', 'trestbps', 'chol', 'thalach', 'oldpeak', 'slope', 'cp']
+    ctx = ", ".join([f"{k}={patient_context.get(k)}" for k in ctx_keys if k in patient_context])
+
+    return f"""
+You are a health coach writing neutral, educational tips (not medical advice).
+
+Patient context (for tone): {ctx}
+
+Requested counterfactual adjustments:
+{bullets}
+
+For EACH bullet above, give ONE short actionable suggestion (lifestyle/diet/exercise/general habit or “discuss with a cardiologist” when appropriate).
+- No diagnoses, no prescriptions.
+- ≤ 24 words per bullet.
+Return bullet points only.
+"""
+
+
+def get_ai_suggestions(chat_fn, changes, patient_context, st_obj=None):
+    if not changes:
+        return "No feature changes recommended."
+    prompt = format_suggestion_prompt(changes, patient_context)
+    if st_obj:
+        with st_obj.spinner("Generating suggestions…"):
+            return chat_fn(OPENAI_MODEL, [{"role": "user", "content": prompt}], temperature=0.3, max_tokens=220)
+    return chat_fn(OPENAI_MODEL, [{"role": "user", "content": prompt}], temperature=0.3, max_tokens=220)
+# ---------- end OpenAI block ----------
+
+
+# --------------------------- Page & Theme --------------------------- #
+st.set_page_config(
+    page_title="Counterfactual Explorer — Heart Disease",
+    page_icon="🫀",
+    layout="wide"
+)
+
+# CSS tuned for both light and dark themes
+st.markdown(
+    """
+    <style>
+      :root {
+        --card-bg-light: #ffffff;
+        --card-bg-dark: #111418;
+        --card-border-light: rgba(0,0,0,0.07);
+        --card-border-dark: rgba(255,255,255,0.08);
+        --muted-light: #4a4a4a;
+        --muted-dark: #a8b3bd;
+      }
+      @media (prefers-color-scheme: dark) {
+        .app-card {
+          background: var(--card-bg-dark) !important;
+          border-color: var(--card-border-dark) !important;
+        }
+        .muted { color: var(--muted-dark) !important; }
+      }
+      @media (prefers-color-scheme: light) {
+        .app-card {
+          background: var(--card-bg-light) !important;
+          border-color: var(--card-border-light) !important;
+        }
+        .muted { color: var(--muted-light) !important; }
+      }
+      .app-card{
+        border: 1px solid;
+        border-radius: 14px;
+        padding: 16px 18px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+        margin-bottom: 16px;
+      }
+      .section-title{
+        margin: 4px 0 12px 0;
+      }
+      .tight-caption{ margin-top: -6px; }
+      .btn-wide > button{ width:100%; }
+      .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+      .stTabs [data-baseweb="tab"]{
+        height: 42px; padding-top: 8px; border-radius: 10px 10px 0 0;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 # --------------------------- Config --------------------------- #
-CSV_PATH = "heart_disease_uci.csv"   # <— will be loaded automatically from same folder
+CSV_PATH = "heart_disease_uci.csv"
 
 EXPECTED_CATEGORICAL = ['sex', 'origin', 'cp', 'fbs', 'restecg', 'exang', 'slope', 'thal']
 EXPECTED_CONTINUOUS  = ['age', 'trestbps', 'chol', 'thalach', 'oldpeak', 'ca']
@@ -81,7 +229,6 @@ def pretty(c): return NICE_LABELS.get(c, c)
 
 # --------------------------- Data prep --------------------------- #
 def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
-    # tolerate common variants
     rename_map = {}
     if 'dataset' in df.columns and 'origin' not in df.columns:
         rename_map['dataset'] = 'origin'
@@ -180,108 +327,61 @@ def load_and_train_models(csv_path: str):
         auc = roc_auc_score(yte, xgb.predict_proba(Xte)[:,1])
         models['XGBoost'] = {'pipe': xgb, 'acc': acc, 'auc': auc, 'Xtest': Xte, 'ytest': yte}
 
-    # return cleaned df as well (for SHAP background, DiCE raw)
     return df, X, y, models
 
-# --------------------------- SHAP / DiCE helpers --------------------------- #
-import re
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-
+# --------------------------- SHAP helpers --------------------------- #
 def _transform_and_names(pipe, X_df):
-    """Transform X_df with the pipeline's preprocessor and return (X_trans, trans_feature_names, groups_map)."""
     pre = pipe.named_steps['prep']
     X_trans = pre.transform(X_df)
-
-    # Get transformed feature names (sklearn >=1.0)
     try:
         trans_names = pre.get_feature_names_out()
     except Exception:
-        # Fallback: generic names
         trans_names = np.array([f"f{i}" for i in range(X_trans.shape[1])])
 
-    # Build a grouping map from transformed names back to original raw feature names
-    # Typical patterns:
-    #   "num__age"  -> group "age"
-    #   "cat__cp_asymptomatic" -> group "cp"
     groups = []
     for name in trans_names:
         if name.startswith("num__"):
-            groups.append(name.replace("num__", ""))  # e.g., age, trestbps
+            groups.append(name.replace("num__", ""))
         elif name.startswith("cat__"):
-            # cat__<raw_feature>_<value>
-            s = name.replace("cat__", "")
-            # raw feature is up to the first '_' (remaining is category value)
-            raw = s.split("_", 1)[0]
+            raw = name.replace("cat__", "").split("_", 1)[0]
             groups.append(raw)
         else:
             groups.append(name)
-    groups = np.array(groups)
-    return X_trans, trans_names, groups
+    return X_trans, np.array(trans_names), np.array(groups)
 
 def shap_topk_bar(pipe, X_df, instance_df, k=8, title="SHAP contributions (top-k)"):
-    """Compute SHAP on the pipeline's transformed numeric space, then aggregate back to raw feature names."""
-    # Prepare transformed data
-    # Use a small background sample to keep it responsive
-    bg = X_df.sample(min(len(X_df), N_SHAP_BACKGROUND), random_state=42)
-    X_bg_t, trans_names, groups = _transform_and_names(pipe, bg)
-    X_inst_t, _, _ = _transform_and_names(pipe, instance_df)
-
+    pre = pipe.named_steps['prep']
     clf = pipe.named_steps['clf']
 
-    # Choose explainer based on model type
-    if HAS_XGB and isinstance(clf, XGBClassifier):
-        explainer = shap.TreeExplainer(clf)
-        # class-1 SHAP values for binary classification
-        sv_all = explainer.shap_values(X_inst_t)
-        # xgboost returns array for class-1 directly (newer shap), or list [class0, class1] (older shap).
-        if isinstance(sv_all, list):
-            sv = sv_all[1]  # take class 1
-        else:
-            sv = sv_all
-        sv = sv.reshape(1, -1)
-    elif isinstance(clf, RandomForestClassifier):
-        explainer = shap.TreeExplainer(clf)
-        sv_all = explainer.shap_values(X_inst_t)
-        # RandomForest usually returns list per class
-        if isinstance(sv_all, list):
-            sv = sv_all[1]
-        else:
-            sv = sv_all
-        sv = sv.reshape(1, -1)
-    elif isinstance(clf, LogisticRegression):
-        # LinearExplainer on transformed numeric features
-        explainer = shap.LinearExplainer(clf, X_bg_t)
-        sv = explainer.shap_values(X_inst_t)
-        if isinstance(sv, list):  # sometimes returns [class0, class1]
-            sv = sv[1]
-        sv = np.array(sv).reshape(1, -1)
+    bg_raw = X_df.sample(min(len(X_df), N_SHAP_BACKGROUND), random_state=42)
+    X_bg_t, trans_names, groups = _transform_and_names(pipe, bg_raw)
+    X_inst_t, _, _ = _transform_and_names(pipe, instance_df)
+
+    if hasattr(clf, "predict_proba"):
+        f_t = lambda data: clf.predict_proba(data)[:, 1]
     else:
-        # Fallback: KernelExplainer on transformed numeric features
-        f = lambda data: clf.predict_proba(data)[:, 1] if hasattr(clf, "predict_proba") else clf.predict(data)
-        explainer = shap.KernelExplainer(f, X_bg_t)
-        sv = explainer.shap_values(X_inst_t, nsamples=100)
-        if isinstance(sv, list):
-            sv = sv[1]
-        sv = np.array(sv).reshape(1, -1)
+        f_t = lambda data: clf.predict(data)
 
-    # Aggregate OHE columns back to their raw feature groups by summing contributions
-    sv_series = pd.Series(sv.flatten(), index=trans_names)
+    with st.spinner("Computing SHAP explanations..."):
+        explainer = shap.Explainer(f_t, X_bg_t)
+        sv = explainer(X_inst_t)[0].values
+
+    sv_series = pd.Series(sv, index=trans_names)
     agg = sv_series.groupby(groups).sum().sort_values(key=np.abs, ascending=False)
-
     topk = agg.head(k)
 
-    # Plot barh with direction (positive/negative)
-    fig, ax = plt.subplots(figsize=(7, 4))
-    colors = ['#1f77b4' if v >= 0 else '#d62728' for v in topk.values]
-    ax.barh(range(len(topk))[::-1], topk.values[::-1], tick_label=[pretty(c) for c in topk.index[::-1]], color=colors)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    colors = ['#2F80ED' if v >= 0 else '#EB5757' for v in topk.values]
+    ax.barh(range(len(topk))[::-1], topk.values[::-1],
+            tick_label=[pretty(c) for c in topk.index[::-1]], color=colors)
     ax.axvline(0, linestyle='--', linewidth=1)
     ax.set_title(title)
-    ax.set_xlabel("SHAP value (aggregated to raw features)")
+    ax.set_xlabel("SHAP value (aggregated)")
     fig.tight_layout()
 
-    return fig, topk, None  # base value not necessary for this bar plot
+    return fig, topk, None
 
+# --------------------------- DiCE helpers --------------------------- #
 def dice_cf(pipeline, raw_df, query_instance, immutables, permitted_range, n_cf=N_CF, desired_class=0, method="genetic"):
     d = dice_ml.Data(
         dataframe=raw_df,
@@ -321,7 +421,7 @@ def english_explanation(b_row, a_row, pred_b, pred_a):
         return f"Prediction changes from {to_text[pred_b]} to {to_text[pred_a]} without feature changes."
     return "If you adjust " + "; ".join(changes) + f", the prediction changes from {to_text[pred_b]} to {to_text[pred_a]}."
 
-def pdf_report(filename, meta, prediction, prob, fig_paths, delta_tables, explanations):
+def pdf_report(filename, meta, prediction, prob, fig_paths, delta_tables, explanations, ai_suggestions_blocks):
     c = canvas.Canvas(filename, pagesize=A4)
     w, h = A4; y = h - 50
     c.setFont("Helvetica-Bold", 14); c.drawString(40, y, "Counterfactual Report — Heart Disease (Demo)"); y -= 20
@@ -339,9 +439,10 @@ def pdf_report(filename, meta, prediction, prob, fig_paths, delta_tables, explan
             c.drawImage(img, 40, y-200, width=300, height=200, preserveAspectRatio=True, mask='auto')
             y -= 210
             if y < 120: c.showPage(); y = h - 60
-        except Exception: pass
+        except Exception:
+            pass
 
-    for i, (df, expl) in enumerate(zip(delta_tables, explanations), 1):
+    for i, (df, expl, sugg) in enumerate(zip(delta_tables, explanations, ai_suggestions_blocks), 1):
         if y < 120: c.showPage(); y = h - 60
         c.setFont("Helvetica-Bold", 11); c.drawString(40, y, f"Counterfactual {i}:"); y -= 14
         c.setFont("Helvetica", 9)
@@ -349,46 +450,65 @@ def pdf_report(filename, meta, prediction, prob, fig_paths, delta_tables, explan
             c.drawString(40, y, f"- {row['Feature']}: {row['Before']} → {row['After']} (Δ={row['Delta']}) [{row['Feasibility']}]"); y -= 12
             if y < 120: c.showPage(); y = h - 60
         if len(df) > 12: c.drawString(40, y, f"... ({len(df)-12} more changes)"); y -= 12
-        c.drawString(40, y, f"Explanation: {expl}"); y -= 18
+        c.drawString(40, y, f"Explanation: {expl}"); y -= 12
+        c.drawString(40, y, "Suggestions:"); y -= 12
+        for line in sugg.splitlines():
+            c.drawString(46, y, line[:110]); y -= 11
+            if y < 120: c.showPage(); y = h - 60
 
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(40, y, "DISCLAIMER: Educational demo. Not medical advice.")
     c.save()
 
 # --------------------------- App UI --------------------------- #
-st.title("🫀 Counterfactual Explorer — UCI Heart Disease (No Upload)")
-st.caption("Data is auto-loaded from `heart_disease_uci.csv` in this folder. Models are trained once and cached.")
+st.title("🫀 Counterfactual Explorer — UCI Heart Disease")
+st.caption("Loads `heart_disease_uci.csv`. Models are cached after first run. **Educational demo — not medical advice.**")
 
-with st.spinner("Loading data & training models (first run only)..."):
-    df, X, y, models = load_and_train_models(CSV_PATH)
+with st.container():
+    with st.spinner("Loading data & training models (first run only)…"):
+        df, X, y, models = load_and_train_models(CSV_PATH)
 
-# Sidebar options
-st.sidebar.title("⚙️ Settings")
+# Sidebar — configuration
+with st.sidebar:
+    st.header("⚙️ Settings")
 
-immutables = st.sidebar.multiselect(
-    "Immutable features",
-    options=EXPECTED_CATEGORICAL + EXPECTED_CONTINUOUS,
-    default=IMMUTABLE_DEFAULT
-)
+    if not OPENAI_API_KEY:
+        st.warning("OpenAI key not found in .env. Suggestions will be disabled.", icon="⚠️")
+    else:
+        st.success("OpenAI suggestions enabled via .env", icon="✅")
 
-permitted_range = {}
-for c, (lo, hi) in PERMITTED_RANGE_DEFAULT.items():
-    lo_v = st.sidebar.number_input(f"{pretty(c)} min", value=float(lo))
-    hi_v = st.sidebar.number_input(f"{pretty(c)} max", value=float(hi))
-    if lo_v > hi_v: st.sidebar.error(f"{c}: min > max")
-    permitted_range[c] = (lo_v, hi_v)
-desired_class = st.sidebar.selectbox("Desired class for CFs", [0,1], index=0)
-cf_method = st.sidebar.selectbox("DiCE method", ["genetic","random"], index=0)
+    st.subheader("Immutables & Ranges")
+    immutables = st.multiselect(
+        "Immutable features",
+        options=EXPECTED_CATEGORICAL + EXPECTED_CONTINUOUS,
+        default=IMMUTABLE_DEFAULT
+    )
 
-# Model picker
+    permitted_range = {}
+    for c, (lo, hi) in PERMITTED_RANGE_DEFAULT.items():
+        lo_v = st.number_input(f"{pretty(c)} min", value=float(lo))
+        hi_v = st.number_input(f"{pretty(c)} max", value=float(hi))
+        if lo_v > hi_v: st.error(f"{c}: min > max")
+        permitted_range[c] = (lo_v, hi_v)
+
+    desired_class = st.selectbox("Desired class for CFs", [0,1], index=0)
+    cf_method = st.selectbox("DiCE method", ["genetic","random"], index=0)
+
+# Model picker row
 model_names = list(models.keys())
-choice = st.selectbox("Choose a model", model_names, index=0)
-pipe = models[choice]['pipe']; Xtest = models[choice]['Xtest']; ytest = models[choice]['ytest']
+top_row = st.container()
+with top_row:
+    pick_col, metrics_col = st.columns([2, 1])
+    with pick_col:
+        choice = st.selectbox("Model", model_names, index=0)
+    with metrics_col:
+        st.markdown('<div class="app-card">', unsafe_allow_html=True)
+        m1, m2 = st.columns(2)
+        with m1: st.metric("Accuracy", f"{models[choice]['acc']*100:.2f}%")
+        with m2: st.metric("ROC AUC", f"{models[choice]['auc']:.3f}")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-c1, c2, c3 = st.columns(3)
-with c1: st.metric("Accuracy", f"{models[choice]['acc']*100:.2f}%")
-with c2: st.metric("ROC AUC", f"{models[choice]['auc']:.3f}")
-with c3: st.caption(f"Trained: now (cached)")
+pipe = models[choice]['pipe']; Xtest = models[choice]['Xtest']
 
 # pick a positive case (for risk reduction demos)
 def pick_positive_case(pipe, X_test):
@@ -398,26 +518,36 @@ def pick_positive_case(pipe, X_test):
 
 query = pick_positive_case(pipe, Xtest)
 
+# Editable Patient Form (3 columns)
+st.markdown('<div class="app-card">', unsafe_allow_html=True)
 st.subheader("🎯 Current Patient (Editable)")
+
 def cat_options(col): return sorted(list(map(str, X[col].unique())))
 
 colA, colB, colC = st.columns(3)
 with colA:
     age_val = st.number_input(pretty('age'), value=float(query['age'].iloc[0]), step=1.0)
-    sex_val = st.selectbox(pretty('sex'), options=cat_options('sex'), index=cat_options('sex').index(query['sex'].iloc[0]))
-    origin_val = st.selectbox(pretty('origin'), options=cat_options('origin'), index=cat_options('origin').index(query['origin'].iloc[0]))
-    cp_val = st.selectbox(pretty('cp'), options=cat_options('cp'), index=cat_options('cp').index(query['cp'].iloc[0]))
+    sex_val = st.selectbox(pretty('sex'), options=cat_options('sex'),
+                           index=cat_options('sex').index(query['sex'].iloc[0]))
+    origin_val = st.selectbox(pretty('origin'), options=cat_options('origin'),
+                              index=cat_options('origin').index(query['origin'].iloc[0]))
+    cp_val = st.selectbox(pretty('cp'), options=cat_options('cp'),
+                          index=cat_options('cp').index(query['cp'].iloc[0]))
 with colB:
     trestbps_val = st.slider(pretty('trestbps'), 90, 200, int(query['trestbps'].iloc[0]))
     chol_val     = st.slider(pretty('chol'), 100, 400, int(query['chol'].iloc[0]))
     thalach_val  = st.slider(pretty('thalach'), 60, 220, int(query['thalach'].iloc[0]))
-    fbs_val      = st.selectbox(pretty('fbs'), options=['True','False'], index=0 if query['fbs'].iloc[0]=='True' else 1)
+    fbs_val      = st.selectbox(pretty('fbs'), options=['True','False'],
+                                index=0 if query['fbs'].iloc[0]=='True' else 1)
 with colC:
-    exang_val    = st.selectbox(pretty('exang'), options=['True','False'], index=0 if query['exang'].iloc[0]=='True' else 1)
+    exang_val    = st.selectbox(pretty('exang'), options=['True','False'],
+                                index=0 if query['exang'].iloc[0]=='True' else 1)
     oldpeak_val  = st.slider(pretty('oldpeak'), 0.0, 6.5, float(query['oldpeak'].iloc[0]), step=0.1)
-    slope_val    = st.selectbox(pretty('slope'), options=cat_options('slope'), index=cat_options('slope').index(query['slope'].iloc[0]))
+    slope_val    = st.selectbox(pretty('slope'), options=cat_options('slope'),
+                                index=cat_options('slope').index(query['slope'].iloc[0]))
     ca_val       = st.slider(pretty('ca'), 0, 4, int(query['ca'].iloc[0]))
-    thal_val     = st.selectbox(pretty('thal'), options=cat_options('thal'), index=cat_options('thal').index(query['thal'].iloc[0]))
+    thal_val     = st.selectbox(pretty('thal'), options=cat_options('thal'),
+                                index=cat_options('thal').index(query['thal'].iloc[0]))
 
 user_row = pd.DataFrame([{
     'age': age_val, 'sex': sex_val, 'origin': origin_val, 'cp': cp_val,
@@ -430,12 +560,17 @@ user_row = pd.DataFrame([{
 pred_proba = pipe.predict_proba(user_row)[0,1] if hasattr(pipe,'predict_proba') else float(pipe.predict(user_row))
 pred_label = int(pred_proba >= 0.5)
 st.info(f"**Prediction:** {'Disease (1)' if pred_label==1 else 'No disease (0)'} | **Prob(disease):** {pred_proba:.3f}")
+st.markdown('</div>', unsafe_allow_html=True)
 
+# SHAP for current patient
+st.markdown('<div class="app-card">', unsafe_allow_html=True)
 fig_shap, _, _ = shap_topk_bar(pipe, X, user_row, k=TOPK_SHAP, title="Top contributions (current patient)")
 st.pyplot(fig_shap)
-st.divider()
+st.caption("Bars left/right show negative/positive contribution to predicted risk.")
+st.markdown('</div>', unsafe_allow_html=True)
 
 # Generate CFs
+st.markdown('<div class="app-card">', unsafe_allow_html=True)
 lcol, rcol = st.columns([1,1])
 with lcol:
     if st.button("✨ Generate Counterfactuals"):
@@ -454,23 +589,32 @@ with lcol:
         })
 with rcol:
     st.caption("Tip: set desired class = 0 for risk reduction.")
+st.markdown('</div>', unsafe_allow_html=True)
 
 cf_obj = st.session_state.get('cf_result')
+ai_chat = get_openai_client()
+
 if cf_obj is not None:
     query_snapshot = st.session_state.get('query_snapshot', user_row)
     cf_df = cf_obj.cf_examples_list[0].final_cfs_df
 
+    st.markdown('<div class="app-card">', unsafe_allow_html=True)
     st.subheader("🧪 Counterfactuals")
-    explanations, delta_tables, fig_paths = [], [], []
-    for i, row in cf_df.iterrows():
-        st.markdown(f"**CF #{i+1}**")
+
+    explanations, delta_tables, fig_paths, ai_suggestions_blocks = [], [], [], []
+
+    # Use enumerate for unique keys and tidy numbering
+    for idx, (_, row) in enumerate(cf_df.iterrows(), 1):
+        st.markdown(f"**CF #{idx}**")
+
         after_row = row[X.columns]
+
         pb = pipe.predict_proba(query_snapshot)[0,1] if hasattr(pipe,'predict_proba') else float(pipe.predict(query_snapshot))
         pa = pipe.predict_proba(pd.DataFrame([after_row], columns=X.columns))[0,1] if hasattr(pipe,'predict_proba') else float(pipe.predict(pd.DataFrame([after_row], columns=X.columns)))
         lb, la = int(pb>=0.5), int(pa>=0.5)
 
         # deltas table
-        recs = []
+        recs, change_list_for_ai = [], []
         for c in X.columns:
             b, a = query_snapshot.iloc[0][c], after_row[c]
             if b != a:
@@ -478,36 +622,63 @@ if cf_obj is not None:
                 except: delta = "—"
                 recs.append({"Feature": pretty(c), "Before": b, "After": a,
                              "Delta": delta, "Feasibility": feasibility_chip(c, b, a, immutables, permitted_range)})
+                change_list_for_ai.append({"feature": pretty(c), "before": b, "after": a})
         delta_df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=["Feature","Before","After","Delta","Feasibility"])
+
         st.dataframe(delta_df, use_container_width=True)
 
         msg = english_explanation(query_snapshot.iloc[0], after_row, lb, la)
         st.success(msg)
         explanations.append(msg); delta_tables.append(delta_df)
 
+        # AI suggestions
+        if ai_chat is None:
+            st.warning("OpenAI suggestions disabled — install `openai` and set OPENAI_API_KEY in .env.", icon="⚠️")
+            ai_text = "(No suggestions — OpenAI unavailable)"
+        else:
+            patient_ctx = {k: user_row.iloc[0][k] for k in user_row.columns}
+            ai_text = get_ai_suggestions(ai_chat, change_list_for_ai, patient_ctx, st_obj=st)
+            st.info(ai_text)
+        ai_suggestions_blocks.append(ai_text)
+
+        # SHAP after CF
         fig_after, _, _ = shap_topk_bar(pipe, X, pd.DataFrame([after_row], columns=X.columns),
                                         k=TOPK_SHAP, title="Top contributions after applying CF")
         st.pyplot(fig_after)
-        png_path = f"shap_cf_{i+1}.png"; fig_after.savefig(png_path, dpi=150, bbox_inches='tight')
+
+        # Save image for PDF
+        png_path = f"shap_cf_{idx}.png"; fig_after.savefig(png_path, dpi=150, bbox_inches='tight')
         fig_paths.append(png_path)
 
-        if st.button(f"Apply CF #{i+1}", key=f"apply_{i}"):
-            for c in X.columns: user_row.at[0, c] = after_row[c]
-            st.experimental_rerun()
+        # Apply CF (unique key via idx)
+        with st.container():
+            st.markdown('<div class="btn-wide">', unsafe_allow_html=True)
+            if st.button(f"Apply CF #{idx}", key=f"apply_{idx}"):
+                for c in X.columns:
+                    user_row.at[0, c] = after_row[c]
+                st.experimental_rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    if st.button("📄 Download PDF Report"):
+        st.divider()
+
+    # PDF download (includes AI suggestions)
+    st.markdown('<div class="btn-wide">', unsafe_allow_html=True)
+    if st.button("📄 Build PDF Report"):
         current_png = "shap_current.png"; fig_shap.savefig(current_png, dpi=150, bbox_inches='tight')
         meta = {"model_name": choice, "model_version": "v1-demo",
                 "cf_method": cf_method, "immutables": immutables, "permitted_range": permitted_range}
         pdf_name = f"cf_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        pdf_report(pdf_name, meta, pred_label, pred_proba, [current_png]+fig_paths, delta_tables, explanations)
+        pdf_report(pdf_name, meta, pred_label, pred_proba, [current_png]+fig_paths, delta_tables, explanations, ai_suggestions_blocks)
         with open(pdf_name, "rb") as f:
-            st.download_button("Download PDF", f, file_name=pdf_name, mime="application/pdf")
+            st.download_button("Download PDF", f, file_name=pdf_name, mime="application/pdf", use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-st.divider()
+# Tabs: Model comparison / consensus / uncertainty
+st.markdown('<div class="app-card">', unsafe_allow_html=True)
 st.subheader("🔀 Model Comparison & Consensus")
 
 tabs = st.tabs([*models.keys(), "Consensus CFs", "Uncertainty"])
+
 for i, name in enumerate(models.keys()):
     with tabs[i]:
         mdl = models[name]; p = mdl['pipe']
@@ -528,7 +699,7 @@ with tabs[len(models.keys())]:
         after = cf_tmp.cf_examples_list[0].final_cfs_df.iloc[0][X.columns]
         ch = set([c for c in X.columns if user_row.iloc[0][c] != after[c]])
         changed_sets.append(ch)
-        st.write(f"**{name}** changed: " + (", ".join(pretty(c) for c in ch) if ch else "(none)"))
+        st.write(f"**{name}** changed:** " + (", ".join(pretty(c) for c in ch) if ch else "(none)"))
     tally = {}
     for s in changed_sets:
         for f in s: tally[f] = tally.get(f,0)+1
@@ -544,14 +715,19 @@ with tabs[len(models.keys())+1]:
         except: probs.append(float(p.predict(user_row)))
     mean_p, std_p = float(np.mean(probs)), float(np.std(probs))
     st.write(f"**Mean prob(disease)**: {mean_p:.3f} ± {std_p:.3f}")
-    fig, ax = plt.subplots(figsize=(6,2.5))
+    fig, ax = plt.subplots(figsize=(6.2,2.6))
     ax.bar([0], [mean_p], yerr=[std_p], capsize=8)
     ax.set_xticks([0]); ax.set_xticklabels(['Ensemble']); ax.set_ylim(0,1)
     ax.set_ylabel("Prob(disease)"); ax.set_title("Uncertainty across models")
+    fig.tight_layout()
     st.pyplot(fig)
 
-st.divider()
+st.markdown('</div>', unsafe_allow_html=True)
+
+# Audit Trail
+st.markdown('<div class="app-card">', unsafe_allow_html=True)
 st.subheader("📝 Audit Trail")
 audit = st.session_state.get('audit', [])
 st.json(audit if audit else [])
-st.markdown("> **Disclaimer:** Educational demo. Not medical advice.")
+st.markdown('> **Disclaimer:** Educational demo. Not medical advice.')
+st.markdown('</div>', unsafe_allow_html=True)
