@@ -1,8 +1,4 @@
-# app.py — Clean UI + .env OpenAI + Fixed Keys
-# ---------------------------------------------
-# Run: streamlit run app.py
-# Data: place heart_disease_uci.csv next to this file
-# .env: OPENAI_API_KEY=sk-...
+# app.py 
 
 import os, json, re
 from datetime import datetime
@@ -42,7 +38,7 @@ from reportlab.lib.utils import ImageReader
 
 # ---------- .env + OpenAI (safe) ----------
 from dotenv import load_dotenv
-load_dotenv()  # loads OPENAI_API_KEY from .env
+load_dotenv()  
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = "gpt-4o-mini"
@@ -315,7 +311,7 @@ def load_and_train_models(csv_path: str):
     auc = roc_auc_score(yte, rf.predict_proba(Xte)[:,1])
     models['Random Forest'] = {'pipe': rf, 'acc': acc, 'auc': auc, 'Xtest': Xte, 'ytest': yte}
 
-    # XGB (optional)
+    # XGB 
     if HAS_XGB:
         xgb = Pipeline(steps=[('prep', build_preprocessor()),
                               ('clf', XGBClassifier(n_estimators=300, max_depth=4,
@@ -403,13 +399,13 @@ def dice_cf(pipeline, raw_df, query_instance, immutables, permitted_range, n_cf=
 def feasibility_chip(col, before, after, immutables, permitted_range):
     if col in immutables: return "⛔ immutable"
     rng = permitted_range.get(col)
-    if rng is None: return "✅ achievable"
+    if rng is None: return "✔ achievable"
     try:
         delta = abs(float(after) - float(before))
         span = max(abs(rng[1]-rng[0]), 1e-9)
-        return "⚠️ tough" if (delta/span) > 0.35 else "✅ achievable"
+        return "✖ tough" if (delta/span) > 0.35 else "✔  achievable"
     except Exception:
-        return "✅ achievable"
+        return "✔  achievable"
 
 def english_explanation(b_row, a_row, pred_b, pred_a):
     changes = []
@@ -461,8 +457,7 @@ def pdf_report(filename, meta, prediction, prob, fig_paths, delta_tables, explan
     c.save()
 
 # --------------------------- App UI --------------------------- #
-st.title("🫀 Counterfactual Explorer — UCI Heart Disease")
-st.caption("Loads `heart_disease_uci.csv`. Models are cached after first run. **Educational demo — not medical advice.**")
+st.title("🫀 Counterfactual Explorer for Heart Risk")
 
 with st.container():
     with st.spinner("Loading data & training models (first run only)…"):
@@ -500,13 +495,11 @@ top_row = st.container()
 with top_row:
     pick_col, metrics_col = st.columns([2, 1])
     with pick_col:
-        choice = st.selectbox("Model", model_names, index=0)
+        choice = st.selectbox("Choose Model for prediction:", model_names, index=0)
     with metrics_col:
-        st.markdown('<div class="app-card">', unsafe_allow_html=True)
         m1, m2 = st.columns(2)
         with m1: st.metric("Accuracy", f"{models[choice]['acc']*100:.2f}%")
         with m2: st.metric("ROC AUC", f"{models[choice]['auc']:.3f}")
-        st.markdown('</div>', unsafe_allow_html=True)
 
 pipe = models[choice]['pipe']; Xtest = models[choice]['Xtest']
 
@@ -519,33 +512,35 @@ def pick_positive_case(pipe, X_test):
 query = pick_positive_case(pipe, Xtest)
 
 # Editable Patient Form (3 columns)
-st.markdown('<div class="app-card">', unsafe_allow_html=True)
-st.subheader("🎯 Current Patient (Editable)")
+st.subheader("🎯 Customise Patient Details")
 
 def cat_options(col): return sorted(list(map(str, X[col].unique())))
 
 colA, colB, colC = st.columns(3)
+
 with colA:
-    age_val = st.number_input(pretty('age'), value=float(query['age'].iloc[0]), step=1.0)
-    sex_val = st.selectbox(pretty('sex'), options=cat_options('sex'),
-                           index=cat_options('sex').index(query['sex'].iloc[0]))
+    age_val    = st.number_input(pretty('age'), value=float(query['age'].iloc[0]), step=1.0)
+    sex_val    = st.selectbox(pretty('sex'), options=cat_options('sex'),
+                              index=cat_options('sex').index(query['sex'].iloc[0]))
     origin_val = st.selectbox(pretty('origin'), options=cat_options('origin'),
                               index=cat_options('origin').index(query['origin'].iloc[0]))
-    cp_val = st.selectbox(pretty('cp'), options=cat_options('cp'),
-                          index=cat_options('cp').index(query['cp'].iloc[0]))
+
 with colB:
     trestbps_val = st.slider(pretty('trestbps'), 90, 200, int(query['trestbps'].iloc[0]))
     chol_val     = st.slider(pretty('chol'), 100, 400, int(query['chol'].iloc[0]))
     thalach_val  = st.slider(pretty('thalach'), 60, 220, int(query['thalach'].iloc[0]))
-    fbs_val      = st.selectbox(pretty('fbs'), options=['True','False'],
-                                index=0 if query['fbs'].iloc[0]=='True' else 1)
+    oldpeak_val  = st.slider(pretty('oldpeak'), 0.0, 6.5, float(query['oldpeak'].iloc[0]), step=0.1)
+    ca_val       = st.slider(pretty('ca'), 0, 4, int(query['ca'].iloc[0]))  # Major vessels
+
 with colC:
+    cp_val       = st.selectbox(pretty('cp'), options=cat_options('cp'),
+                                index=cat_options('cp').index(query['cp'].iloc[0]))
     exang_val    = st.selectbox(pretty('exang'), options=['True','False'],
                                 index=0 if query['exang'].iloc[0]=='True' else 1)
-    oldpeak_val  = st.slider(pretty('oldpeak'), 0.0, 6.5, float(query['oldpeak'].iloc[0]), step=0.1)
+    fbs_val      = st.selectbox(pretty('fbs'), options=['True','False'],
+                                index=0 if query['fbs'].iloc[0]=='True' else 1)
     slope_val    = st.selectbox(pretty('slope'), options=cat_options('slope'),
                                 index=cat_options('slope').index(query['slope'].iloc[0]))
-    ca_val       = st.slider(pretty('ca'), 0, 4, int(query['ca'].iloc[0]))
     thal_val     = st.selectbox(pretty('thal'), options=cat_options('thal'),
                                 index=cat_options('thal').index(query['thal'].iloc[0]))
 
@@ -560,17 +555,13 @@ user_row = pd.DataFrame([{
 pred_proba = pipe.predict_proba(user_row)[0,1] if hasattr(pipe,'predict_proba') else float(pipe.predict(user_row))
 pred_label = int(pred_proba >= 0.5)
 st.info(f"**Prediction:** {'Disease (1)' if pred_label==1 else 'No disease (0)'} | **Prob(disease):** {pred_proba:.3f}")
-st.markdown('</div>', unsafe_allow_html=True)
 
 # SHAP for current patient
-st.markdown('<div class="app-card">', unsafe_allow_html=True)
 fig_shap, _, _ = shap_topk_bar(pipe, X, user_row, k=TOPK_SHAP, title="Top contributions (current patient)")
 st.pyplot(fig_shap)
 st.caption("Bars left/right show negative/positive contribution to predicted risk.")
-st.markdown('</div>', unsafe_allow_html=True)
 
 # Generate CFs
-st.markdown('<div class="app-card">', unsafe_allow_html=True)
 lcol, rcol = st.columns([1,1])
 with lcol:
     if st.button("✨ Generate Counterfactuals"):
@@ -589,7 +580,6 @@ with lcol:
         })
 with rcol:
     st.caption("Tip: set desired class = 0 for risk reduction.")
-st.markdown('</div>', unsafe_allow_html=True)
 
 cf_obj = st.session_state.get('cf_result')
 ai_chat = get_openai_client()
@@ -674,7 +664,6 @@ if cf_obj is not None:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Tabs: Model comparison / consensus / uncertainty
-st.markdown('<div class="app-card">', unsafe_allow_html=True)
 st.subheader("🔀 Model Comparison & Consensus")
 
 tabs = st.tabs([*models.keys(), "Consensus CFs", "Uncertainty"])
@@ -699,7 +688,7 @@ with tabs[len(models.keys())]:
         after = cf_tmp.cf_examples_list[0].final_cfs_df.iloc[0][X.columns]
         ch = set([c for c in X.columns if user_row.iloc[0][c] != after[c]])
         changed_sets.append(ch)
-        st.write(f"**{name}** changed:** " + (", ".join(pretty(c) for c in ch) if ch else "(none)"))
+        st.write(f"**{name} changed**: " + (", ".join(pretty(c) for c in ch) if ch else "(none)"))
     tally = {}
     for s in changed_sets:
         for f in s: tally[f] = tally.get(f,0)+1
@@ -722,12 +711,8 @@ with tabs[len(models.keys())+1]:
     fig.tight_layout()
     st.pyplot(fig)
 
-st.markdown('</div>', unsafe_allow_html=True)
-
 # Audit Trail
-st.markdown('<div class="app-card">', unsafe_allow_html=True)
 st.subheader("📝 Audit Trail")
 audit = st.session_state.get('audit', [])
 st.json(audit if audit else [])
 st.markdown('> **Disclaimer:** Educational demo. Not medical advice.')
-st.markdown('</div>', unsafe_allow_html=True)
