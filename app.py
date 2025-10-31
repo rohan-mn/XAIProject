@@ -1,4 +1,8 @@
-# app.py 
+# app.py  — Counterfactual Explorer (ONE best plan across all models, domain-logic filtered)
+# ----------------------------------------------------------------------------------------
+# Run: streamlit run app.py
+# Data: place heart_disease_uci.csv next to this file
+# .env: OPENAI_API_KEY=sk-...
 
 import os, json, re
 from datetime import datetime
@@ -38,7 +42,7 @@ from reportlab.lib.utils import ImageReader
 
 # ---------- .env + OpenAI (safe) ----------
 from dotenv import load_dotenv
-load_dotenv()  
+load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = "gpt-4o-mini"
@@ -191,7 +195,8 @@ EXPECTED_CONTINUOUS  = ['age', 'trestbps', 'chol', 'thalach', 'oldpeak', 'ca']
 RAW_TARGET = 'num'
 BIN_TARGET = 'target'
 
-IMMUTABLE_DEFAULT = ['sex', 'age', 'origin']
+# SAFER DEFAULTS: block clinically illogical categorical flips by default
+IMMUTABLE_DEFAULT = ['sex', 'age', 'origin', 'cp', 'restecg', 'thal']
 PERMITTED_RANGE_DEFAULT = {
     'trestbps': (90, 200),
     'chol':     (100, 400),
@@ -222,6 +227,190 @@ NICE_LABELS = {
     BIN_TARGET: 'Target (1=disease, 0=none)'
 }
 def pretty(c): return NICE_LABELS.get(c, c)
+
+# ========================= SAFE CF GENERATION (with retries + fallback) =========================
+class _CFResultLike:
+    """Tiny adapter to look like cf_obj from DiCE for your downstream code."""
+    def __init__(self, df, cols):
+        from types import SimpleNamespace
+        self.cf_examples_list = [SimpleNamespace(final_cfs_df=df[cols + []])]
+        self._meta = {}  # to optionally carry tier info
+
+def _widen_ranges(ranges, pct=0.1):
+    widened = {}
+    for k, (lo, hi) in ranges.items():
+        span = float(hi) - float(lo)
+        widened[k] = (float(lo) - pct*span, float(hi) + pct*span)
+    return widened
+
+def _temporary_relax_immutables(immutables, keep=set(('sex','age','origin','cp','restecg','thal'))):
+    """Return a slightly relaxed immutable set (keeps the strictly clinical ones)."""
+    return list(sorted(keep))
+
+def _is_positive(pipe, Xrow):
+    try:
+        p = pipe.predict_proba(Xrow)[0,1]
+        return p >= 0.5, float(p)
+    except Exception:
+        y = float(pipe.predict(Xrow))
+        return y >= 0.5, y
+
+def _shap_guided_line_search(pipe, X_df_all, X_start, permitted_range, desired_class=0):
+    """
+    Fallback: change only plausible features in plausible directions until flip.
+    Returns a single-row DataFrame or None.
+    """
+    directions = {
+        'trestbps': -1,  # lower
+        'chol': -1,      # lower
+        'oldpeak': -1,   # lower
+        'ca': -1,        # lower
+        'thalach': +1,   # higher
+        'exang': 'False',
+        'fbs': 'False',
+    }
+    from copy import deepcopy
+    inst = X_start.copy()
+    pipe_clf = pipe.named_steps.get('clf', None)
+    pre = pipe.named_steps['prep']
+    # small SHAP on-the-fly
+    bg = X_df_all.sample(min(len(X_df_all), 50), random_state=42)
+    X_bg_t = pre.transform(bg)
+    X_inst_t = pre.transform(inst)
+    f = (lambda d: pipe_clf.predict_proba(d)[:,1]) if hasattr(pipe_clf, "predict_proba") else (lambda d: pipe_clf.predict(d))
+    try:
+        explainer = shap.Explainer(f, X_bg_t)
+        sv = explainer(X_inst_t)[0].values
+        names = pre.get_feature_names_out()
+        # aggregate to raw feature groups (num__/cat__)
+        groups = []
+        for n in names:
+            if n.startswith('num__'): groups.append(n.replace('num__',''))
+            elif n.startswith('cat__'): groups.append(n.replace('cat__','').split('_',1)[0])
+            else: groups.append(n)
+        imp = pd.Series(sv, index=groups).groupby(level=0).sum().abs().sort_values(ascending=False)
+        ordered_feats = [c for c in imp.index if c in directions]
+    except Exception:
+        # fallback ordering
+        ordered_feats = ['oldpeak','trestbps','chol','thalach','exang','fbs','ca']
+
+    def _clip(k, v):
+        if k in permitted_range:
+            lo, hi = permitted_range[k]
+            return float(min(max(v, lo), hi))
+        return v
+
+    trial = inst.copy()
+    # booleans to False first (if allowed)
+    for bfeat in ['exang','fbs']:
+        if bfeat in trial.columns and isinstance(trial.iloc[0][bfeat], str) and trial.iloc[0][bfeat].strip().lower() != 'false':
+            trial.at[0, bfeat] = 'False'
+            is_pos, prob = _is_positive(pipe, trial)
+            if not is_pos and desired_class == 0:
+                return trial
+
+    # gradual continuous nudges
+    max_iters = 60
+    for _ in range(max_iters):
+        is_pos, prob = _is_positive(pipe, trial)
+        if (desired_class == 0 and not is_pos) or (desired_class == 1 and is_pos):
+            return trial
+        improved = False
+        for k in ordered_feats:
+            if k not in trial.columns or k not in permitted_range:
+                continue
+            lo, hi = permitted_range[k]
+            span = max(1e-9, float(hi) - float(lo))
+            step = 0.02 * span  # 2% step
+            val = float(trial.iloc[0][k])
+            if directions[k] == -1 and val > lo:
+                trial.at[0, k] = _clip(k, val - step)
+                improved = True
+            elif directions[k] == +1 and val < hi:
+                trial.at[0, k] = _clip(k, val + step)
+                improved = True
+        if not improved:
+            break
+    return None  # no flip found
+
+def generate_cf_safe(pipeline, raw_df, query_instance, immutables, permitted_range,
+                     desired_class=0, method="genetic", total_cfs=3):
+    """
+    Robust CF generator:
+    1) Try DiCE with increasing leniency.
+    2) Fallback to SHAP-guided line search if DiCE still fails.
+    Returns a dict: {"cf": DiCE-like object or None, "tier": <str>} for UI transparency.
+    """
+    # If already in desired class, return None politely
+    is_pos, prob = _is_positive(pipeline, query_instance)
+    current = 1 if is_pos else 0
+    if current == desired_class:
+        return {"cf": None, "tier": "already-in-desired-class"}
+
+    cols = list(raw_df.drop(columns=[BIN_TARGET]).columns)
+
+    # Attempt ladder (increasing leniency)
+    ladder = [
+        dict(label="DiCE / method=genetic (strict)", method=method, total_CFs=total_cfs,
+             immutables=list(immutables), rng=permitted_range),
+        dict(label="DiCE / method=random (strict)", method="random", total_CFs=max(5, total_cfs),
+             immutables=list(immutables), rng=permitted_range),
+        dict(label="DiCE / widened ranges +10%", method="genetic", total_CFs=max(8, total_cfs),
+             immutables=list(immutables), rng=_widen_ranges(permitted_range, 0.10)),
+        dict(label="DiCE / relax immutables + ranges +15%", method="random", total_CFs=max(10, total_cfs),
+             immutables=_temporary_relax_immutables(immutables), rng=_widen_ranges(permitted_range, 0.15)),
+    ]
+
+    last_err = None
+    for at in ladder:
+        try:
+            d = dice_ml.Data(
+                dataframe=raw_df,
+                continuous_features=[c for c in EXPECTED_CONTINUOUS if c in cols],
+                categorical_features=[c for c in EXPECTED_CATEGORICAL if c in cols],
+                outcome_name=BIN_TARGET
+            )
+            m = dice_ml.Model(model=pipeline, backend="sklearn")
+            exp = Dice(d, m, method=at['method'])
+            features_can_vary = [f for f in (EXPECTED_CONTINUOUS + EXPECTED_CATEGORICAL) if f not in at['immutables']]
+            if not features_can_vary:
+                continue
+            cf = exp.generate_counterfactuals(
+                query_instance,
+                total_CFs=at['total_CFs'],
+                desired_class=desired_class,
+                features_to_vary=features_can_vary,
+                permitted_range=at['rng']
+            )
+            if cf and cf.cf_examples_list and not cf.cf_examples_list[0].final_cfs_df.empty:
+                # carry tier within the object for downstream tracking
+                try:
+                    setattr(cf, "_meta", {"relaxation_tier": at["label"]})
+                except Exception:
+                    pass
+                return {"cf": cf, "tier": at["label"]}
+        except Exception as e:
+            last_err = e
+            continue
+
+    # ----------------- Fallback: SHAP-guided line search -----------------
+    try:
+        X_all = raw_df.drop(columns=[BIN_TARGET])
+        candidate = _shap_guided_line_search(pipeline, X_all, query_instance.copy(), permitted_range, desired_class)
+        if candidate is not None:
+            flipped, _ = _is_positive(pipeline, candidate)
+            if (desired_class == 0 and not flipped) or (desired_class == 1 and flipped):
+                df = candidate.copy()
+                cf_like = _CFResultLike(df, cols)
+                try:
+                    setattr(cf_like, "_meta", {"relaxation_tier": "SHAP-guided line search (fallback)"})
+                except Exception:
+                    pass
+                return {"cf": cf_like, "tier": "SHAP-guided line search (fallback)"}
+    except Exception as e:
+        last_err = e
+
+    return {"cf": None, "tier": "no-solution-found"}
 
 # --------------------------- Data prep --------------------------- #
 def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -311,7 +500,7 @@ def load_and_train_models(csv_path: str):
     auc = roc_auc_score(yte, rf.predict_proba(Xte)[:,1])
     models['Random Forest'] = {'pipe': rf, 'acc': acc, 'auc': auc, 'Xtest': Xte, 'ytest': yte}
 
-    # XGB 
+    # XGB
     if HAS_XGB:
         xgb = Pipeline(steps=[('prep', build_preprocessor()),
                               ('clf', XGBClassifier(n_estimators=300, max_depth=4,
@@ -377,25 +566,7 @@ def shap_topk_bar(pipe, X_df, instance_df, k=8, title="SHAP contributions (top-k
 
     return fig, topk, None
 
-# --------------------------- DiCE helpers --------------------------- #
-def dice_cf(pipeline, raw_df, query_instance, immutables, permitted_range, n_cf=N_CF, desired_class=0, method="genetic"):
-    d = dice_ml.Data(
-        dataframe=raw_df,
-        continuous_features=EXPECTED_CONTINUOUS,
-        categorical_features=EXPECTED_CATEGORICAL,
-        outcome_name=BIN_TARGET
-    )
-    m = dice_ml.Model(model=pipeline, backend="sklearn")
-    exp = Dice(d, m, method=method)
-    features_can_vary = [f for f in EXPECTED_CONTINUOUS + EXPECTED_CATEGORICAL if f not in immutables]
-    return exp.generate_counterfactuals(
-        query_instance,
-        total_CFs=n_cf,
-        desired_class=desired_class,
-        features_to_vary=features_can_vary,
-        permitted_range=permitted_range
-    )
-
+# --------------------------- Plausibility helpers --------------------------- #
 def feasibility_chip(col, before, after, immutables, permitted_range):
     if col in immutables: return "⛔ immutable"
     rng = permitted_range.get(col)
@@ -407,6 +578,72 @@ def feasibility_chip(col, before, after, immutables, permitted_range):
     except Exception:
         return "✔  achievable"
 
+# --------------------------- Domain Logic for CF Plausibility --------------------------- #
+DOMAIN_RULES = {
+    'trestbps': 'down',
+    'chol':     'down',
+    'oldpeak':  'down',
+    'ca':       'down',
+    'thalach':  'up',
+    'exang':   'to_False',
+    'fbs':     'to_False',
+}
+FORBID_CHANGE = set(['cp', 'restecg', 'thal'])  # also in IMMUTABLE_DEFAULT by default
+
+def _dir_ok(col, before, after):
+    rule = DOMAIN_RULES.get(col)
+    if rule is None:
+        return True
+
+    b, a = str(before), str(after)
+    try:
+        fb, fa = float(before), float(after)
+    except Exception:
+        fb = fa = None
+
+    if rule == 'down' and (fb is not None) and (fa is not None):
+        return fa <= fb
+    if rule == 'up' and (fb is not None) and (fa is not None):
+        return fa >= fb
+    if rule == 'to_False':
+        return a.strip().lower() == 'false'
+    return True
+
+def is_logical_change(col, before, after, immutables):
+    if col in immutables or col in FORBID_CHANGE:
+        return before == after
+    if before == after:
+        return True
+    return _dir_ok(col, before, after)
+
+def cf_violations_and_cost(baseline_row, after_row, immutables, permitted_range):
+    """
+    Returns (n_violations, n_changes, n_tough, total_norm_delta).
+    """
+    n_viol, n_changes, n_tough = 0, 0, 0
+    total_norm = 0.0
+    for c in baseline_row.index:
+        b, a = baseline_row[c], after_row[c]
+        if b == a:
+            continue
+        n_changes += 1
+
+        if not is_logical_change(c, b, a, immutables):
+            n_viol += 1
+
+        chip = feasibility_chip(c, b, a, immutables, permitted_range)
+        if 'tough' in chip:
+            n_tough += 1
+
+        if c in permitted_range:
+            try:
+                lo, hi = permitted_range[c]
+                span = max(abs(float(hi) - float(lo)), 1e-9)
+                total_norm += abs(float(a) - float(b)) / span
+            except Exception:
+                pass
+    return n_viol, n_changes, n_tough, total_norm
+
 def english_explanation(b_row, a_row, pred_b, pred_a):
     changes = []
     for c in b_row.index:
@@ -417,6 +654,7 @@ def english_explanation(b_row, a_row, pred_b, pred_a):
         return f"Prediction changes from {to_text[pred_b]} to {to_text[pred_a]} without feature changes."
     return "If you adjust " + "; ".join(changes) + f", the prediction changes from {to_text[pred_b]} to {to_text[pred_a]}."
 
+# --------------------------- PDF --------------------------- #
 def pdf_report(filename, meta, prediction, prob, fig_paths, delta_tables, explanations, ai_suggestions_blocks):
     c = canvas.Canvas(filename, pagesize=A4)
     w, h = A4; y = h - 50
@@ -448,7 +686,7 @@ def pdf_report(filename, meta, prediction, prob, fig_paths, delta_tables, explan
         if len(df) > 12: c.drawString(40, y, f"... ({len(df)-12} more changes)"); y -= 12
         c.drawString(40, y, f"Explanation: {expl}"); y -= 12
         c.drawString(40, y, "Suggestions:"); y -= 12
-        for line in sugg.splitlines():
+        for line in str(sugg).splitlines():
             c.drawString(46, y, line[:110]); y -= 11
             if y < 120: c.showPage(); y = h - 60
 
@@ -487,7 +725,7 @@ with st.sidebar:
         permitted_range[c] = (lo_v, hi_v)
 
     desired_class = st.selectbox("Desired class for CFs", [0,1], index=0)
-    cf_method = st.selectbox("DiCE method", ["genetic","random"], index=0)
+    cf_method = st.selectbox("DiCE method (first attempt)", ["genetic","random"], index=0)
 
 # Model picker row
 model_names = list(models.keys())
@@ -513,25 +751,20 @@ query = pick_positive_case(pipe, Xtest)
 
 # Editable Patient Form (3 columns)
 st.subheader("🎯 Customise Patient Details")
-
 def cat_options(col): return sorted(list(map(str, X[col].unique())))
-
 colA, colB, colC = st.columns(3)
-
 with colA:
     age_val    = st.number_input(pretty('age'), value=float(query['age'].iloc[0]), step=1.0)
     sex_val    = st.selectbox(pretty('sex'), options=cat_options('sex'),
                               index=cat_options('sex').index(query['sex'].iloc[0]))
     origin_val = st.selectbox(pretty('origin'), options=cat_options('origin'),
                               index=cat_options('origin').index(query['origin'].iloc[0]))
-
 with colB:
     trestbps_val = st.slider(pretty('trestbps'), 90, 200, int(query['trestbps'].iloc[0]))
     chol_val     = st.slider(pretty('chol'), 100, 400, int(query['chol'].iloc[0]))
     thalach_val  = st.slider(pretty('thalach'), 60, 220, int(query['thalach'].iloc[0]))
     oldpeak_val  = st.slider(pretty('oldpeak'), 0.0, 6.5, float(query['oldpeak'].iloc[0]), step=0.1)
-    ca_val       = st.slider(pretty('ca'), 0, 4, int(query['ca'].iloc[0]))  # Major vessels
-
+    ca_val       = st.slider(pretty('ca'), 0, 4, int(query['ca'].iloc[0]))
 with colC:
     cp_val       = st.selectbox(pretty('cp'), options=cat_options('cp'),
                                 index=cat_options('cp').index(query['cp'].iloc[0]))
@@ -561,20 +794,30 @@ fig_shap, _, _ = shap_topk_bar(pipe, X, user_row, k=TOPK_SHAP, title="Top contri
 st.pyplot(fig_shap)
 st.caption("Bars left/right show negative/positive contribution to predicted risk.")
 
-# Generate CFs
+# Generate CFs (per chosen model)
 lcol, rcol = st.columns([1,1])
 with lcol:
     if st.button("✨ Generate Counterfactuals"):
         raw_for_dice = pd.concat([X, y.rename(BIN_TARGET)], axis=1)
-        cf_obj = dice_cf(pipe, raw_for_dice, user_row, immutables, permitted_range,
-                         n_cf=N_CF, desired_class=desired_class, method=cf_method)
-        st.session_state['cf_result'] = cf_obj
+        safe_res = generate_cf_safe(
+            pipeline=pipe,
+            raw_df=raw_for_dice,
+            query_instance=user_row,
+            immutables=immutables,
+            permitted_range=permitted_range,
+            desired_class=desired_class,
+            method=cf_method,
+            total_cfs=N_CF
+        )
+        st.session_state['cf_result'] = safe_res.get("cf")
+        st.session_state['cf_relaxation_tier'] = safe_res.get("tier", "n/a")
         st.session_state['query_snapshot'] = user_row.copy()
         st.session_state.setdefault('audit', []).append({
             "time": datetime.now().isoformat(timespec='seconds'),
             "model_name": choice,
             "model_version": "v1-demo",
-            "cf_method": cf_method,
+            "cf_method_first_try": cf_method,
+            "relaxation_tier": st.session_state['cf_relaxation_tier'],
             "immutables": immutables,
             "permitted_range": permitted_range
         })
@@ -587,16 +830,16 @@ ai_chat = get_openai_client()
 if cf_obj is not None:
     query_snapshot = st.session_state.get('query_snapshot', user_row)
     cf_df = cf_obj.cf_examples_list[0].final_cfs_df
+    tier_label = getattr(cf_obj, "_meta", {}).get("relaxation_tier", st.session_state.get("cf_relaxation_tier", "n/a"))
 
     st.markdown('<div class="app-card">', unsafe_allow_html=True)
-    st.subheader("🧪 Counterfactuals")
+    st.subheader("🧪 Counterfactuals (current model)")
+    st.caption(f"Relaxation tier that succeeded: **{tier_label}**")
 
     explanations, delta_tables, fig_paths, ai_suggestions_blocks = [], [], [], []
 
-    # Use enumerate for unique keys and tidy numbering
     for idx, (_, row) in enumerate(cf_df.iterrows(), 1):
         st.markdown(f"**CF #{idx}**")
-
         after_row = row[X.columns]
 
         pb = pipe.predict_proba(query_snapshot)[0,1] if hasattr(pipe,'predict_proba') else float(pipe.predict(query_snapshot))
@@ -654,6 +897,28 @@ if cf_obj is not None:
     # PDF download (includes AI suggestions)
     st.markdown('<div class="btn-wide">', unsafe_allow_html=True)
     if st.button("📄 Build PDF Report"):
+        # If Best Plan exists, prepend it to the PDF sections
+        if st.session_state.get('best_cf'):
+            best = st.session_state['best_cf']
+            after_best = best['after_row']
+            recs_best = []
+            for c in X.columns:
+                b, a = user_row.iloc[0][c], after_best[c]
+                if b != a:
+                    try: delta = round(float(a)-float(b), 3)
+                    except: delta = "—"
+                    recs_best.append({"Feature": pretty(c), "Before": b, "After": a,
+                                      "Delta": delta, "Feasibility": feasibility_chip(c, b, a, immutables, permitted_range)})
+            delta_tables.insert(0, pd.DataFrame(recs_best))
+            tier_text = best.get("relaxation_tier", "n/a")
+            explanations.insert(0, f"Best plan across models. Mean risk: {best['mean_before']:.3f} → {best['mean_after']:.3f} (Δ={best['risk_drop']:.3f}). Tier: {tier_text}.")
+            if ai_chat and len(recs_best):
+                patient_ctx = {k: user_row.iloc[0][k] for k in user_row.columns}
+                changes_for_ai = [{"feature": r["Feature"], "before": r["Before"], "after": r["After"]} for r in recs_best]
+                ai_suggestions_blocks.insert(0, get_ai_suggestions(ai_chat, changes_for_ai, patient_ctx))
+            else:
+                ai_suggestions_blocks.insert(0, "(No suggestions — OpenAI unavailable)")
+
         current_png = "shap_current.png"; fig_shap.savefig(current_png, dpi=150, bbox_inches='tight')
         meta = {"model_name": choice, "model_version": "v1-demo",
                 "cf_method": cf_method, "immutables": immutables, "permitted_range": permitted_range}
@@ -663,7 +928,165 @@ if cf_obj is not None:
             st.download_button("Download PDF", f, file_name=pdf_name, mime="application/pdf", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# Tabs: Model comparison / consensus / uncertainty
+# --------------------------- All-Models Best Plan (SAFE generator) --------------------------- #
+def generate_cf_candidates_across_models(models, raw_df, user_row, immutables, permitted_range,
+                                         desired_class=0, method="genetic", per_model=3):
+    """Collect CF candidates from every model via SAFE generator (carry tier)."""
+    candidates = []
+    for name, mdl in models.items():
+        p = mdl['pipe']
+        try:
+            safe_res = generate_cf_safe(
+                pipeline=p,
+                raw_df=raw_df,
+                query_instance=user_row,
+                immutables=immutables,
+                permitted_range=permitted_range,
+                desired_class=desired_class,
+                method=method,
+                total_cfs=per_model
+            )
+            cf_tmp = safe_res.get("cf")
+            tier = safe_res.get("tier", "n/a")
+            if not cf_tmp or not getattr(cf_tmp, "cf_examples_list", None):
+                continue
+            cfs = cf_tmp.cf_examples_list[0].final_cfs_df
+            for _, r in cfs.iterrows():
+                after = r[user_row.columns]
+                candidates.append({
+                    "source_model": name,
+                    "after_row": after,
+                    "relaxation_tier": tier
+                })
+        except Exception as e:
+            print(f"[CF WARN] {name}: {e}")
+            continue
+    return candidates
+
+def evaluate_candidate(candidate, user_row, models, immutables, permitted_range):
+    """Compute ensemble risk drop + penalties."""
+    after = candidate["after_row"]
+
+    # ensemble risk before/after
+    probs_before, probs_after = [], []
+    for mdl in models.values():
+        p = mdl['pipe']
+        try:
+            probs_before.append(p.predict_proba(user_row)[0,1])
+            probs_after.append(p.predict_proba(pd.DataFrame([after], columns=user_row.columns))[0,1])
+        except Exception:
+            probs_before.append(float(p.predict(user_row)))
+            probs_after.append(float(p.predict(pd.DataFrame([after], columns=user_row.columns))))
+    mean_before = float(np.mean(probs_before))
+    mean_after  = float(np.mean(probs_after))
+    risk_drop   = max(0.0, mean_before - mean_after)  # clamp
+
+    # violations / feasibility / magnitude
+    n_viol, n_changes, n_tough, total_norm = cf_violations_and_cost(user_row.iloc[0], after, immutables, permitted_range)
+
+    # score: higher is better. Heavy penalty for any violation.
+    score = (1000.0 if n_viol == 0 else -1000.0*n_viol) \
+            + 100.0 * risk_drop \
+            - 2.5 * n_changes \
+            - 1.5 * n_tough \
+            - 0.5 * total_norm
+
+    return {
+        "score": score,
+        "risk_drop": risk_drop,
+        "mean_before": mean_before,
+        "mean_after": mean_after,
+        "n_changes": n_changes,
+        "n_tough": n_tough,
+        "n_viol": n_viol,
+        "after_row": after,
+        "source_model": candidate["source_model"],
+        "relaxation_tier": candidate.get("relaxation_tier", "n/a")
+    }
+
+def pick_best_counterfactual(models, raw_df, user_row, immutables, permitted_range,
+                             desired_class=0, method="genetic", per_model=3):
+    """Return best-scored CF across all models (or None)."""
+    cands = generate_cf_candidates_across_models(models, raw_df, user_row, immutables,
+                                                 permitted_range, desired_class, method, per_model)
+    if not cands:
+        return None, []
+
+    scored = [evaluate_candidate(c, user_row, models, immutables, permitted_range) for c in cands]
+    # keep only violation-free first; fallback to best overall if none
+    ok = [s for s in scored if s['n_viol'] == 0]
+    pool = ok if ok else scored
+    best = max(pool, key=lambda s: s['score'])
+    return best, scored
+
+# --------------------------- One Best Plan UI --------------------------- #
+st.subheader("⭐ Best, Clinically-Plausible Plan (across models)")
+
+col_bestA, col_bestB = st.columns([1,1])
+with col_bestA:
+    if st.button("Find ONE Best Counterfactual Across All Models"):
+        raw_for_dice = pd.concat([X, y.rename(BIN_TARGET)], axis=1)
+        best, scored = pick_best_counterfactual(
+            models=models,
+            raw_df=raw_for_dice,
+            user_row=user_row,
+            immutables=immutables,
+            permitted_range=permitted_range,
+            desired_class=0,    # target class 0 = no heart disease
+            method=cf_method,
+            per_model=3         # or N_CF
+        )
+        st.session_state['best_cf'] = best
+        st.session_state['best_scored'] = scored
+
+best_cf = st.session_state.get('best_cf')
+if best_cf:
+    after = best_cf['after_row']
+    # Build delta table
+    recs, change_list_for_ai = [], []
+    for c in X.columns:
+        b, a = user_row.iloc[0][c], after[c]
+        if b != a:
+            try: delta = round(float(a)-float(b), 3)
+            except: delta = "—"
+            recs.append({"Feature": pretty(c), "Before": b, "After": a,
+                         "Delta": delta, "Feasibility": feasibility_chip(c, b, a, immutables, permitted_range)})
+            change_list_for_ai.append({"feature": pretty(c), "before": b, "after": a})
+    best_df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=["Feature","Before","After","Delta","Feasibility"])
+
+    st.success(
+        f"**Source model:** {best_cf['source_model']}  \n"
+        f"**Ensemble mean prob(disease):** {best_cf['mean_before']:.3f} → {best_cf['mean_after']:.3f}  "
+        f"(Δ={best_cf['risk_drop']:.3f})  \n"
+        f"**Changes:** {best_cf['n_changes']} | **Tough steps:** {best_cf['n_tough']} | **Rule violations:** {best_cf['n_viol']}  \n"
+        f"**Relaxation tier used:** {best_cf.get('relaxation_tier','n/a')}"
+    )
+    st.dataframe(best_df, use_container_width=True)
+
+    # Natural-language explanation + AI tips
+    before_lab = int((best_cf['mean_before']) >= 0.5)
+    after_lab  = int((best_cf['mean_after'])  >= 0.5)
+    msg = english_explanation(user_row.iloc[0], after, before_lab, after_lab)
+    st.info(msg)
+
+    ai_chat = get_openai_client()
+    if ai_chat is None:
+        st.warning("OpenAI suggestions disabled — set OPENAI_API_KEY in .env.", icon="⚠️")
+    else:
+        patient_ctx = {k: user_row.iloc[0][k] for k in user_row.columns}
+        tips = get_ai_suggestions(ai_chat, change_list_for_ai, patient_ctx, st_obj=st)
+        st.markdown("**Practical tips:**")
+        st.info(tips)
+
+    # Apply button
+    if st.button("Apply Best Plan"):
+        for c in X.columns:
+            user_row.at[0, c] = after[c]
+        st.experimental_rerun()
+else:
+    st.caption("Click the button above to compute a single, consensus-aware counterfactual plan.")
+
+# --------------------------- Tabs: Model comparison / consensus / uncertainty --------------------------- #
 st.subheader("🔀 Model Comparison & Consensus")
 
 tabs = st.tabs([*models.keys(), "Consensus CFs", "Uncertainty"])
@@ -681,19 +1104,36 @@ with tabs[len(models.keys())]:
     st.caption("Features that appear in CF changes for ≥2 models.")
     raw_for_dice = pd.concat([X, y.rename(BIN_TARGET)], axis=1)
     changed_sets = []
+    tier_notes = []
     for name, mdl in models.items():
         p = mdl['pipe']
-        cf_tmp = dice_cf(p, raw_for_dice, user_row, immutables, permitted_range,
-                         n_cf=1, desired_class=desired_class, method=cf_method)
+        safe_res = generate_cf_safe(
+            pipeline=p,
+            raw_df=raw_for_dice,
+            query_instance=user_row,
+            immutables=immutables,
+            permitted_range=permitted_range,
+            desired_class=desired_class,
+            method=cf_method,
+            total_cfs=1
+        )
+        cf_tmp = safe_res.get("cf")
+        tier = safe_res.get("tier","n/a")
+        if not cf_tmp or not getattr(cf_tmp, "cf_examples_list", None):
+            st.write(f"**{name}** changed: (none) — tier: {tier}")
+            changed_sets.append(set())
+            tier_notes.append((name, tier))
+            continue
         after = cf_tmp.cf_examples_list[0].final_cfs_df.iloc[0][X.columns]
         ch = set([c for c in X.columns if user_row.iloc[0][c] != after[c]])
         changed_sets.append(ch)
-        st.write(f"**{name} changed**: " + (", ".join(pretty(c) for c in ch) if ch else "(none)"))
+        tier_notes.append((name, tier))
+        st.write(f"**{name}** changed**: " + (", ".join(pretty(c) for c in ch) if ch else "(none)") + f"  — tier: _{tier}_")
     tally = {}
     for s in changed_sets:
         for f in s: tally[f] = tally.get(f,0)+1
     consensus = [f for f,k in tally.items() if k>=2]
-    if consensus: st.success("Consensus (≥2 models): " + ", ".join(pretty(c) for c in consensus))
+    if consensus: st.success("Consensus (≥2 models): " + ", ".join(prety for prety in [pretty(c) for c in consensus]))
     else: st.warning("No consensus found.")
 
 with tabs[len(models.keys())+1]:
